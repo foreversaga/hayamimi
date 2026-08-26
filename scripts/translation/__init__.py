@@ -5,9 +5,11 @@ from .contracts import (
     TranslationUpdate,
 )
 from .coordinator import StreamingTranslationCoordinator
+from .worker import StreamingTranslationWorker
 
 __all__ = [
     "StreamingTranslationCoordinator",
+    "StreamingTranslationWorker",
     "TranslationBackend",
     "TranslationContext",
     "TranslationRequest",
