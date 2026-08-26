@@ -1,155 +1,322 @@
-"""Local subtitle overlay server for OBS (Mojicast-style).
+"""Local subtitle overlay, dashboard, transcript and SSE server."""
+from __future__ import annotations
 
-Serves an overlay page at http://localhost:<port>/ suitable for an OBS
-browser source (transparent background), and streams partial/final subtitle
-events over SSE at /events. Designed to be driven by realtime_transcribe.py.
-"""
 import http.server
 import json
 import queue
 import threading
 
-OVERLAY_HTML = """<!doctype html>
+
+OVERLAY_HTML = r"""<!doctype html>
+<html lang="zh-Hant">
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
   html, body { margin: 0; background: transparent; overflow: hidden; }
   #box {
-    position: absolute; left: 0; right: 0; bottom: 4vh;
-    text-align: center; font-family: "Yu Gothic UI", "Meiryo", sans-serif;
-    font-size: 5vh; line-height: 1.4; color: #fff;
-    text-shadow: 0 0 8px #000, 0 0 4px #000, 2px 2px 2px #000;
+    position: absolute; left: 2vw; right: 2vw; bottom: 4vh; text-align: center;
+    font-family: system-ui, "Noto Sans CJK TC", "Microsoft JhengHei", sans-serif;
+    color: #fff; text-shadow: 0 0 8px #000, 2px 2px 3px #000;
   }
-  #partial { opacity: 0.75; font-style: italic; }
+  #source { font-size: 3.0vh; line-height: 1.4; opacity: .78; margin-bottom: .35em; }
+  #translations { font-size: 4.8vh; line-height: 1.35; font-weight: 700; }
+  .translation-line { margin-top: .12em; }
+  .lang { font-size: .36em; opacity: .65; margin-right: .6em; vertical-align: .25em; }
+  .spec { opacity: .62; font-weight: 500; }
 </style>
-<div id="box"><span id="final"></span> <span id="partial"></span></div>
+<div id="box">
+  <div id="source"></div>
+  <div id="translations"></div>
+</div>
 <script>
-  const fin = document.getElementById("final");
-  const par = document.getElementById("partial");
+  const source = document.getElementById("source");
+  const translations = document.getElementById("translations");
+  let activeSegment = null;
   let clearTimer = null;
+  const rows = new Map();
+
+  function scheduleClear(ms=7000) {
+    if (clearTimer) clearTimeout(clearTimer);
+    clearTimer = setTimeout(() => {
+      source.textContent = ""; translations.textContent = ""; rows.clear(); activeSegment = null;
+    }, ms);
+  }
+
+  function row(lang) {
+    if (rows.has(lang)) return rows.get(lang);
+    const el = document.createElement("div"); el.className = "translation-line";
+    const badge = document.createElement("span"); badge.className = "lang"; badge.textContent = lang;
+    const committed = document.createElement("span");
+    const speculative = document.createElement("span"); speculative.className = "spec";
+    el.append(badge, committed, speculative); translations.appendChild(el);
+    const value = {el, committed, speculative}; rows.set(lang, value); return value;
+  }
+
+  function resetFor(segmentId) {
+    if (!segmentId || activeSegment === segmentId) return;
+    activeSegment = segmentId; translations.textContent = ""; rows.clear();
+  }
+
   const es = new EventSource("/events");
   es.onmessage = (e) => {
     const ev = JSON.parse(e.data);
-    if (clearTimer) { clearTimeout(clearTimer); clearTimer = null; }
     if (ev.type === "partial") {
-      par.textContent = ev.text;
+      resetFor(ev.segment_id); source.textContent = ev.text || ""; scheduleClear();
     } else if (ev.type === "final") {
-      fin.textContent = ev.text;
-      par.textContent = "";
-      clearTimer = setTimeout(() => { fin.textContent = ""; }, 6000);
+      resetFor(ev.segment_id); source.textContent = ev.text || ""; scheduleClear();
+    } else if (ev.type === "translation_partial") {
+      resetFor(ev.segment_id);
+      const r = row(ev.lang || "?");
+      r.committed.textContent = ev.committed || "";
+      r.speculative.textContent = ev.speculative || "";
+      scheduleClear();
+    } else if (ev.type === "translation_final") {
+      resetFor(ev.segment_id);
+      const r = row(ev.lang || "?");
+      r.committed.textContent = ev.text || ""; r.speculative.textContent = "";
+      scheduleClear(8000);
+    } else if (ev.type === "translation") {
+      const r = row(ev.lang || "?"); r.committed.textContent = ev.text || "";
+      r.speculative.textContent = ""; scheduleClear(8000);
     }
   };
 </script>
+</html>
 """
 
 
-TRANSCRIPT_HTML = """<!doctype html>
+TRANSCRIPT_HTML = r"""<!doctype html>
+<html lang="zh-Hant">
 <meta charset="utf-8">
-<title>Transcript</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>hayamimi transcript</title>
 <style>
-  body { margin: 0; padding: 2rem; background: #111; color: #eee;
-         font-family: "Yu Gothic UI", "Meiryo", sans-serif; font-size: 1.1rem; line-height: 1.8; }
-  #lines p { margin: 0.2rem 0; }
-  .lang { color: #888; font-size: 0.8em; margin-right: 0.6em; }
+  body { margin: 0; padding: 1.5rem; background: #101217; color: #eee;
+    font-family: system-ui, "Noto Sans CJK TC", sans-serif; line-height: 1.7; }
+  .entry { padding: .65rem 0; border-bottom: 1px solid #292e39; }
+  .meta { color: #8f98aa; font-size: .75rem; margin-right: .6rem; }
+  .translation { color: #d9c9a9; margin-left: 1.5rem; }
 </style>
 <div id="lines"></div>
 <script>
   const box = document.getElementById("lines");
+  const refined = new Map();
+  function add(text, meta, cls="") {
+    const p = document.createElement("div"); p.className = "entry " + cls;
+    const m = document.createElement("span"); m.className = "meta"; m.textContent = meta;
+    p.append(m, document.createTextNode(text)); box.appendChild(p);
+    window.scrollTo(0, document.body.scrollHeight); return p;
+  }
   const es = new EventSource("/events");
   es.onmessage = (e) => {
     const ev = JSON.parse(e.data);
-    if (ev.type !== "refine") return;
-    const p = document.createElement("p");
-    p.innerHTML = '<span class="lang">[' + (ev.lang || "?") + ']</span>';
-    p.appendChild(document.createTextNode(ev.text));
-    box.appendChild(p);
-    window.scrollTo(0, document.body.scrollHeight);
+    if (ev.type === "refine") {
+      const el = add(ev.text || "", `[${ev.speaker ? ev.speaker + " · " : ""}${ev.lang || "?"}]`);
+      if (ev.segment_id) refined.set(ev.segment_id, el);
+    } else if (ev.type === "translation_refine") {
+      add(ev.text || "", `[→${ev.lang || "?"}]`, "translation");
+    }
   };
 </script>
+</html>
 """
 
 
-DASHBOARD_HTML = '<!doctype html>\n<html lang="ja">\n<meta charset="utf-8">\n<meta name="viewport" content="width=device-width, initial-scale=1">\n<title>hayamimi</title>\n<link rel="preconnect" href="https://fonts.googleapis.com">\n<link href="https://fonts.googleapis.com/css2?family=Shippori+Mincho+B1:wght@600;800&family=Zen+Kaku+Gothic+New:wght@400;500;700&family=IBM+Plex+Mono:wght@400;600&display=swap" rel="stylesheet">\n<style>\n  :root {\n    --ink: #0d0f13; --ink-2: #14171d; --line: #2a2f3a;\n    --paper: #ece5d8; --paper-dim: #b0a898;\n    --shu: #e04f2f;\n    --c-ja: #e04f2f; --c-en: #5b7fd4; --c-zh: #d4a13c; --c-ko: #3fae9d; --c-yue: #b06bc6; --c-xx: #7a8194;\n    --mono: "IBM Plex Mono", monospace;\n  }\n  * { box-sizing: border-box; }\n  html, body { height: 100%; }\n  body {\n    margin: 0; background: var(--ink); color: var(--paper);\n    font-family: "Zen Kaku Gothic New", "Yu Gothic UI", sans-serif;\n    background-image:\n      radial-gradient(1200px 500px at 85% -10%, rgba(224,79,47,.07), transparent 60%),\n      repeating-linear-gradient(0deg, transparent 0 2px, rgba(255,255,255,.006) 2px 4px);\n    display: flex; flex-direction: column; overflow: hidden;\n  }\n  header {\n    display: flex; align-items: baseline; gap: 1.1rem;\n    padding: .9rem 1.6rem .7rem; border-bottom: 1px solid var(--line);\n    flex: none;\n  }\n  .logotype { font-family: "Shippori Mincho B1", serif; font-weight: 800;\n    font-size: 1.7rem; letter-spacing: .12em; }\n  .logotype em { font-style: normal; color: var(--shu); }\n  .romaji { font-family: var(--mono); font-size: .72rem; letter-spacing: .3em;\n    color: var(--paper-dim); }\n  .spacer { flex: 1; }\n  .chip { font-family: var(--mono); font-size: .72rem; color: var(--paper-dim);\n    border: 1px solid var(--line); border-radius: 3px; padding: .25rem .6rem; }\n  .chip b { color: var(--paper); font-weight: 600; }\n  #live-dot { width: .55rem; height: .55rem; border-radius: 50%;\n    background: var(--c-xx); align-self: center; }\n  #live-dot.on { background: var(--shu);\n    animation: pulse 1.6s ease-out infinite; }\n  @keyframes pulse {\n    from { box-shadow: 0 0 0 0 rgba(224,79,47,.5); }\n    to { box-shadow: 0 0 0 10px rgba(224,79,47,0); } }\n\n  #partial-strip {\n    flex: none; padding: 1.2rem 1.6rem 1.1rem; min-height: 5.6rem;\n    border-bottom: 1px solid var(--line); background: var(--ink-2);\n    position: relative; overflow: hidden;\n  }\n  #partial-strip::before {\n    content: "いま聞き取り中"; position: absolute; top: .55rem; left: 1.65rem;\n    font-size: .62rem; letter-spacing: .35em; color: var(--paper-dim);\n  }\n  #partial-text {\n    font-family: "Shippori Mincho B1", serif; font-weight: 600;\n    font-size: 1.5rem; line-height: 1.5; margin-top: 1rem; min-height: 2.2rem;\n  }\n  #partial-text.idle { color: var(--paper-dim); opacity: .5; }\n  .caret { display: inline-block; width: .5em; height: 1.05em;\n    background: var(--shu); vertical-align: -0.12em; margin-left: .18em;\n    animation: blink 1s steps(2) infinite; }\n  @keyframes blink { 50% { opacity: 0; } }\n\n  main { flex: 1; display: grid; grid-template-columns: minmax(0, 7fr) minmax(0, 5fr);\n    min-height: 0; }\n  section { display: flex; flex-direction: column; min-height: 0; }\n  section + section { border-left: 1px solid var(--line); }\n  h2 { flex: none; margin: 0; padding: .7rem 1.6rem; font-size: .68rem;\n    font-weight: 700; letter-spacing: .35em; color: var(--paper-dim);\n    border-bottom: 1px solid var(--line); }\n  h2 span { color: var(--shu); }\n  .scroll { flex: 1; overflow-y: auto; padding: 1rem 1.6rem 2rem;\n    scrollbar-width: thin; scrollbar-color: var(--line) transparent; }\n\n  .final-card {\n    display: grid; grid-template-columns: auto 1fr auto; gap: .7rem;\n    align-items: baseline; padding: .55rem 0;\n    border-bottom: 1px dashed rgba(42,47,58,.7);\n    animation: rise .28s cubic-bezier(.2,.9,.3,1) both;\n  }\n  @keyframes rise { from { opacity: 0; transform: translateY(8px); } }\n  .badges { display: flex; gap: .35rem; align-items: center; }\n  .lang-badge { font-family: var(--mono); font-size: .62rem; font-weight: 600;\n    padding: .12rem .42rem; border-radius: 2px; color: var(--ink);\n    letter-spacing: .08em; }\n  .spk { font-family: var(--mono); font-size: .62rem; color: var(--paper-dim);\n    border: 1px solid var(--line); padding: .1rem .34rem; border-radius: 2px; }\n  .final-text { font-size: 1.02rem; line-height: 1.65; }\n  .lat { font-family: var(--mono); font-size: .66rem; color: var(--paper-dim); }\n  .trans-line { grid-column: 2; font-size: .85rem; color: var(--paper-dim);\n    line-height: 1.5; }\n  .trans-line b { font-family: var(--mono); font-size: .6rem; font-weight: 600;\n    color: var(--shu); margin-right: .45em; letter-spacing: .1em; }\n\n  .refine-p { margin: 0 0 1rem; font-family: "Shippori Mincho B1", serif;\n    font-weight: 600; font-size: 1.02rem; line-height: 1.9;\n    animation: rise .3s ease both; }\n  .refine-p .meta { font-family: var(--mono); font-size: .62rem; font-weight: 400;\n    color: var(--paper-dim); display: block; margin-bottom: .18rem;\n    letter-spacing: .12em; }\n  .refine-p .meta i { font-style: normal; color: var(--shu); }\n\n  footer { flex: none; display: flex; gap: 1.4rem; padding: .5rem 1.6rem;\n    border-top: 1px solid var(--line); font-family: var(--mono);\n    font-size: .66rem; color: var(--paper-dim); }\n  @media (max-width: 860px) { main { grid-template-columns: 1fr; }\n    section + section { border-left: 0; border-top: 1px solid var(--line); } }\n</style>\n<body>\n<header>\n  <div id="live-dot"></div>\n  <div class="logotype">早<em>耳</em></div>\n  <div class="romaji">hayamimi</div>\n  <div class="spacer"></div>\n  <div class="chip">確定 <b id="n-finals">0</b></div>\n  <div class="chip">平均応答 <b id="mean-lat">&ndash;</b> ms</div>\n  <div class="chip">言語 <b id="langs-seen">&ndash;</b></div>\n</header>\n\n<div id="partial-strip">\n  <div id="partial-text" class="idle">マイクの音声を待っています<span class="caret"></span></div>\n</div>\n\n<main>\n  <section>\n    <h2>確定フィード <span>LIVE</span></h2>\n    <div class="scroll" id="feed"></div>\n  </section>\n  <section>\n    <h2>清書 <span>REFINED</span></h2>\n    <div class="scroll" id="refined"></div>\n  </section>\n</main>\n\n<footer>\n  <div id="conn">connecting&hellip;</div>\n  <div>overlay: /</div>\n  <div>transcript: /transcript</div>\n</footer>\n\n<script>\n  const LANG_COLOR = { ja: "var(--c-ja)", en: "var(--c-en)", zh: "var(--c-zh)",\n                       ko: "var(--c-ko)", yue: "var(--c-yue)" };\n  const feed = document.getElementById("feed");\n  const refined = document.getElementById("refined");\n  const partial = document.getElementById("partial-text");\n  const dot = document.getElementById("live-dot");\n  let finals = 0, latSum = 0, langs = new Set(), lastCard = null, idleTimer = null;\n\n  function badge(lang) {\n    const b = document.createElement("span");\n    b.className = "lang-badge";\n    b.style.background = LANG_COLOR[lang] || "var(--c-xx)";\n    b.textContent = lang || "??";\n    return b;\n  }\n  function stick(el) { el.scrollTop = el.scrollHeight; }\n\n  const es = new EventSource("/events");\n  es.onopen = () => { document.getElementById("conn").textContent = "connected"; dot.classList.add("on"); };\n  es.onerror = () => { document.getElementById("conn").textContent = "reconnecting…"; dot.classList.remove("on"); };\n  es.onmessage = (e) => {\n    const ev = JSON.parse(e.data);\n    if (ev.type === "partial") {\n      partial.classList.remove("idle");\n      partial.textContent = ev.text;\n      const c = document.createElement("span"); c.className = "caret";\n      partial.appendChild(c);\n      clearTimeout(idleTimer);\n      idleTimer = setTimeout(() => partial.classList.add("idle"), 4000);\n    } else if (ev.type === "final") {\n      const card = document.createElement("div"); card.className = "final-card";\n      const badges = document.createElement("div"); badges.className = "badges";\n      badges.appendChild(badge(ev.lang));\n      if (ev.speaker) { const s = document.createElement("span");\n        s.className = "spk"; s.textContent = ev.speaker; badges.appendChild(s); }\n      const t = document.createElement("div"); t.className = "final-text";\n      t.textContent = ev.text;\n      const lat = document.createElement("div"); lat.className = "lat";\n      lat.textContent = ev.latency_ms != null ? Math.round(ev.latency_ms) + "ms" : "";\n      card.append(badges, t, lat);\n      feed.appendChild(card); lastCard = card; stick(feed);\n      finals++; langs.add(ev.lang);\n      if (ev.latency_ms != null) latSum += ev.latency_ms;\n      document.getElementById("n-finals").textContent = finals;\n      document.getElementById("mean-lat").textContent = Math.round(latSum / finals);\n      document.getElementById("langs-seen").textContent = [...langs].join(" ");\n    } else if (ev.type === "translation") {\n      if (!lastCard) return;\n      const tr = document.createElement("div"); tr.className = "trans-line";\n      const b = document.createElement("b"); b.textContent = "→" + ev.lang;\n      tr.appendChild(b); tr.appendChild(document.createTextNode(ev.text));\n      lastCard.appendChild(tr); stick(feed);\n    } else if (ev.type === "refine") {\n      const p = document.createElement("p"); p.className = "refine-p";\n      const meta = document.createElement("span"); meta.className = "meta";\n      const spk = ev.speaker ? ev.speaker + " · " : "";\n      meta.innerHTML = spk + "<i>" + (ev.lang || "?") + "</i>";\n      p.appendChild(meta); p.appendChild(document.createTextNode(ev.text));\n      refined.appendChild(p); stick(refined);\n    }\n  };\n</script>\n</body>\n</html>\n'
+DASHBOARD_HTML = r"""<!doctype html>
+<html lang="zh-Hant">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>hayamimi</title>
+<style>
+  :root { --bg:#0d0f13; --panel:#151922; --line:#2a303c; --text:#eee9df;
+    --muted:#929bad; --accent:#e05b3e; --translation:#e1c690; }
+  * { box-sizing: border-box; }
+  html,body { height:100%; }
+  body { margin:0; background:var(--bg); color:var(--text); font-family:system-ui,"Noto Sans CJK TC",sans-serif;
+    display:flex; flex-direction:column; }
+  header { display:flex; gap:1rem; align-items:center; padding:.8rem 1.2rem; border-bottom:1px solid var(--line); }
+  h1 { font-size:1.15rem; margin:0; letter-spacing:.18em; } h1 b { color:var(--accent); }
+  .spacer { flex:1; } .chip { color:var(--muted); font-size:.78rem; border:1px solid var(--line); padding:.25rem .55rem; border-radius:4px; }
+  #partial-panel { padding:1rem 1.2rem; background:var(--panel); border-bottom:1px solid var(--line); min-height:7.2rem; }
+  .label { color:var(--muted); font-size:.68rem; letter-spacing:.16em; text-transform:uppercase; }
+  #partial-source { font-size:1.35rem; margin-top:.35rem; min-height:2rem; }
+  #partial-translations { color:var(--translation); font-size:1.2rem; margin-top:.45rem; }
+  .partial-tr { margin-top:.2rem; } .partial-tr .spec { opacity:.55; }
+  main { flex:1; min-height:0; display:grid; grid-template-columns:3fr 2fr; }
+  section { min-height:0; display:flex; flex-direction:column; } section+section { border-left:1px solid var(--line); }
+  h2 { margin:0; padding:.65rem 1rem; font-size:.72rem; color:var(--muted); border-bottom:1px solid var(--line); }
+  .scroll { overflow:auto; padding:.6rem 1rem 2rem; }
+  .card { padding:.7rem 0; border-bottom:1px dashed var(--line); }
+  .meta { display:flex; gap:.45rem; color:var(--muted); font-size:.68rem; margin-bottom:.28rem; }
+  .badge { color:#111; background:var(--accent); padding:.08rem .35rem; border-radius:3px; font-weight:700; }
+  .source { font-size:1rem; line-height:1.55; }
+  .tr { margin:.35rem 0 0 1.2rem; color:var(--translation); line-height:1.5; }
+  .tr b { color:var(--accent); font-size:.72rem; margin-right:.5rem; }
+  .refine { padding:.65rem 0; border-bottom:1px dashed var(--line); line-height:1.6; }
+  .error { color:#ff8a80; font-size:.78rem; margin-left:1.2rem; }
+  footer { padding:.4rem 1rem; border-top:1px solid var(--line); color:var(--muted); font-size:.7rem; }
+  @media(max-width:850px){main{grid-template-columns:1fr}section+section{border-left:0;border-top:1px solid var(--line)}}
+</style>
+<header><h1>早<b>耳</b> hayamimi</h1><div class="spacer"></div>
+<div class="chip">final <b id="n-finals">0</b></div><div class="chip">ASR avg <b id="mean-lat">-</b> ms</div>
+<div class="chip" id="conn">connecting</div></header>
+<div id="partial-panel"><div class="label">live source</div><div id="partial-source">waiting for audio…</div>
+<div id="partial-translations"></div></div>
+<main><section><h2>FINAL + TRANSLATION</h2><div class="scroll" id="feed"></div></section>
+<section><h2>REFINED TRANSCRIPT</h2><div class="scroll" id="refined"></div></section></main>
+<footer>overlay / · dashboard /dashboard · transcript /transcript · health /healthz</footer>
+<script>
+  const feed=document.getElementById("feed"), refined=document.getElementById("refined");
+  const partialSource=document.getElementById("partial-source"), partialTr=document.getElementById("partial-translations");
+  const cards=new Map(), partialRows=new Map(); let activeSegment=null, finals=0, latSum=0;
+  function stick(el){el.scrollTop=el.scrollHeight}
+  function clearPartials(segmentId){ if(segmentId && activeSegment!==segmentId){activeSegment=segmentId;partialTr.textContent="";partialRows.clear();} }
+  function partialRow(lang){if(partialRows.has(lang))return partialRows.get(lang);const d=document.createElement("div");d.className="partial-tr";
+    const b=document.createElement("b");b.textContent="→"+lang+" ";const c=document.createElement("span"),s=document.createElement("span");s.className="spec";
+    d.append(b,c,s);partialTr.appendChild(d);const v={c,s};partialRows.set(lang,v);return v;}
+  function makeCard(ev){const card=document.createElement("div");card.className="card";card.dataset.segment=ev.segment_id||"";
+    const meta=document.createElement("div");meta.className="meta";const badge=document.createElement("span");badge.className="badge";badge.textContent=ev.lang||"?";
+    meta.appendChild(badge);if(ev.speaker){const sp=document.createElement("span");sp.textContent=ev.speaker;meta.appendChild(sp)}
+    const lat=document.createElement("span");lat.textContent=ev.latency_ms!=null?Math.round(ev.latency_ms)+"ms":"";meta.appendChild(lat);
+    const src=document.createElement("div");src.className="source";src.textContent=ev.text||"";card.append(meta,src);feed.appendChild(card);
+    if(ev.segment_id)cards.set(ev.segment_id,card);stick(feed);return card;}
+  function attachTranslation(ev,kind="tr"){const card=cards.get(ev.segment_id);if(!card)return;let el=card.querySelector(`[data-tr-lang="${ev.lang}"]`);
+    if(!el){el=document.createElement("div");el.className=kind;el.dataset.trLang=ev.lang;const b=document.createElement("b");b.textContent="→"+ev.lang;const t=document.createElement("span");el.append(b,t);card.appendChild(el)}
+    el.querySelector("span").textContent=ev.text||"";stick(feed);}
+  const es=new EventSource("/events"); es.onopen=()=>document.getElementById("conn").textContent="connected";
+  es.onerror=()=>document.getElementById("conn").textContent="reconnecting";
+  es.onmessage=(e)=>{const ev=JSON.parse(e.data);
+    if(ev.type==="partial"){clearPartials(ev.segment_id);partialSource.textContent=ev.text||"";}
+    else if(ev.type==="translation_partial"){clearPartials(ev.segment_id);const r=partialRow(ev.lang||"?");r.c.textContent=ev.committed||"";r.s.textContent=ev.speculative||"";}
+    else if(ev.type==="final"){clearPartials(ev.segment_id);partialSource.textContent=ev.text||"";makeCard(ev);finals++;if(ev.latency_ms!=null)latSum+=ev.latency_ms;
+      document.getElementById("n-finals").textContent=finals;document.getElementById("mean-lat").textContent=Math.round(latSum/finals);}
+    else if(ev.type==="translation_final"){attachTranslation(ev);const r=partialRow(ev.lang||"?");r.c.textContent=ev.text||"";r.s.textContent="";}
+    else if(ev.type==="translation"){const last=[...cards.values()].at(-1);if(last){const fake={...ev,segment_id:last.dataset.segment};attachTranslation(fake)}}
+    else if(ev.type==="translation_error"){const card=cards.get(ev.segment_id);if(card){const x=document.createElement("div");x.className="error";x.textContent=`→${ev.lang}: ${ev.error}`;card.appendChild(x)}}
+    else if(ev.type==="refine"){const d=document.createElement("div");d.className="refine";d.dataset.refine=ev.segment_id||"";d.textContent=ev.text||"";refined.appendChild(d);stick(refined);}
+    else if(ev.type==="translation_refine"){const d=document.createElement("div");d.className="tr";const b=document.createElement("b");b.textContent="→"+ev.lang;d.append(b,document.createTextNode(ev.text||""));refined.appendChild(d);stick(refined);}
+  };
+</script>
+</html>
+"""
 
 
 class SubtitleServer:
-    """Fan-out of subtitle events to any number of SSE clients."""
+    """Fan-out subtitle events to SSE clients and serve browser views."""
 
-    def __init__(self, port: int = 8765):
+    def __init__(self, host: str = "127.0.0.1", port: int = 8765):
+        self.host = host
         self.port = port
-        self._clients: list[queue.Queue] = []
-        self._refines: list[str] = []  # recent refine events, replayed to new clients
+        self._clients: list[queue.Queue[str]] = []
+        self._history: list[str] = []
         self._lock = threading.Lock()
-        self._httpd = None
+        self._httpd: http.server.ThreadingHTTPServer | None = None
 
-    def publish(self, event: dict):
+    def publish(self, event: dict) -> None:
         data = json.dumps(event, ensure_ascii=False)
         with self._lock:
-            if event.get("type") == "refine":
-                self._refines.append(data)
-                del self._refines[:-200]
-            for q in self._clients:
-                q.put(data)
+            if event.get("type") in ("refine", "translation_refine"):
+                self._history.append(data)
+                del self._history[:-400]
+            for client in list(self._clients):
+                if client.full():
+                    try:
+                        client.get_nowait()
+                    except queue.Empty:
+                        pass
+                try:
+                    client.put_nowait(data)
+                except queue.Full:
+                    pass
 
-    def partial(self, text: str):
-        self.publish({"type": "partial", "text": text})
+    def partial(self, text: str, segment_id: str = "", lang: str = "") -> None:
+        self.publish({"type": "partial", "text": text, "segment_id": segment_id, "lang": lang})
 
-    def final(self, text: str, lang: str = "", speaker: str = "",
-              latency_ms: float | None = None, tier: str = ""):
-        self.publish({"type": "final", "text": text, "lang": lang,
-                      "speaker": speaker, "latency_ms": latency_ms, "tier": tier})
+    def final(
+        self,
+        text: str,
+        lang: str = "",
+        speaker: str = "",
+        latency_ms: float | None = None,
+        tier: str = "",
+        segment_id: str = "",
+    ) -> None:
+        self.publish({
+            "type": "final",
+            "text": text,
+            "lang": lang,
+            "speaker": speaker,
+            "latency_ms": latency_ms,
+            "tier": tier,
+            "segment_id": segment_id,
+        })
 
     def start(self):
         server = self
 
         class Handler(http.server.BaseHTTPRequestHandler):
-            def log_message(self, *args):  # keep the console clean for subtitles
+            def log_message(self, *args):
                 pass
 
+            def _html(self, body_text: str) -> None:
+                body = body_text.encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
             def do_GET(self):
-                if self.path == "/events":
+                path = self.path.split("?", 1)[0]
+                if path == "/healthz":
+                    body = b'{"status":"ok"}'
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+
+                if path == "/events":
                     self.send_response(200)
                     self.send_header("Content-Type", "text/event-stream")
                     self.send_header("Cache-Control", "no-cache")
+                    self.send_header("Connection", "keep-alive")
                     self.send_header("Access-Control-Allow-Origin", "*")
                     self.end_headers()
-                    q: queue.Queue = queue.Queue()
+                    client: queue.Queue[str] = queue.Queue(maxsize=256)
                     with server._lock:
-                        for past in server._refines:  # replay history to newcomers
-                            q.put(past)
-                        server._clients.append(q)
+                        for past in server._history:
+                            if not client.full():
+                                client.put_nowait(past)
+                        server._clients.append(client)
                     try:
                         while True:
-                            data = q.get()
-                            self.wfile.write(f"data: {data}\n\n".encode("utf-8"))
+                            try:
+                                data = client.get(timeout=15)
+                                frame = f"data: {data}\n\n".encode("utf-8")
+                            except queue.Empty:
+                                frame = b": ping\n\n"
+                            self.wfile.write(frame)
                             self.wfile.flush()
                     except (ConnectionAbortedError, ConnectionResetError, BrokenPipeError):
                         pass
                     finally:
                         with server._lock:
-                            if q in server._clients:
-                                server._clients.remove(q)
-                elif self.path == "/dashboard":
-                    body = DASHBOARD_HTML.encode("utf-8")
-                    self.send_response(200)
-                    self.send_header("Content-Type", "text/html; charset=utf-8")
-                    self.send_header("Content-Length", str(len(body)))
-                    self.end_headers()
-                    self.wfile.write(body)
-                elif self.path == "/transcript":
-                    body = TRANSCRIPT_HTML.encode("utf-8")
-                    self.send_response(200)
-                    self.send_header("Content-Type", "text/html; charset=utf-8")
-                    self.send_header("Content-Length", str(len(body)))
-                    self.end_headers()
-                    self.wfile.write(body)
-                else:
-                    body = OVERLAY_HTML.encode("utf-8")
-                    self.send_response(200)
-                    self.send_header("Content-Type", "text/html; charset=utf-8")
-                    self.send_header("Content-Length", str(len(body)))
-                    self.end_headers()
-                    self.wfile.write(body)
+                            if client in server._clients:
+                                server._clients.remove(client)
+                    return
 
-        self._httpd = http.server.ThreadingHTTPServer(("127.0.0.1", self.port), Handler)
+                if path == "/dashboard":
+                    self._html(DASHBOARD_HTML)
+                elif path == "/transcript":
+                    self._html(TRANSCRIPT_HTML)
+                else:
+                    self._html(OVERLAY_HTML)
+
+        class ReusableThreadingHTTPServer(http.server.ThreadingHTTPServer):
+            allow_reuse_address = True
+
+        self._httpd = ReusableThreadingHTTPServer((self.host, self.port), Handler)
         threading.Thread(target=self._httpd.serve_forever, daemon=True).start()
         return self

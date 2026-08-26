@@ -1,0 +1,96 @@
+services:
+  translator:
+    image: ${VLLM_IMAGE:-vllm/vllm-openai:cu129-nightly-e9d1398d9edfd90fcc1cf783805240e3effec013}
+    restart: unless-stopped
+    ipc: host
+    ulimits:
+      memlock: -1
+      stack: 67108864
+    environment:
+      HF_HOME: /root/.cache/huggingface
+      HUGGING_FACE_HUB_TOKEN: ${HUGGING_FACE_HUB_TOKEN:-}
+    volumes:
+      - ./models/huggingface:/root/.cache/huggingface
+      - ./models/vllm-cache:/root/.cache/vllm
+    command:
+      - ${TRANSLATION_MODEL:-tencent/Hy-MT2-1.8B}
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --trust-remote-code
+      - --max-model-len
+      - ${VLLM_MAX_MODEL_LEN:-8192}
+      - --kv-cache-memory-bytes
+      - ${VLLM_KV_CACHE_MEMORY:-2G}
+      - --kv-cache-dtype
+      - ${VLLM_KV_CACHE_DTYPE:-auto}
+      - --max-num-seqs
+      - ${VLLM_MAX_NUM_SEQS:-4}
+      - --enable-prefix-caching
+    ports:
+      - "127.0.0.1:${TRANSLATOR_PORT:-8000}:8000"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/v1/models', timeout=2)"]
+      interval: 10s
+      timeout: 4s
+      retries: 30
+      start_period: 10m
+
+  hayamimi:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      translator:
+        condition: service_healthy
+    environment:
+      HAYAMIMI_AUTO_DOWNLOAD_MODELS: ${HAYAMIMI_AUTO_DOWNLOAD_MODELS:-true}
+      HAYAMIMI_MODEL_SET: ${HAYAMIMI_MODEL_SET:-full}
+      HAYAMIMI_THREADS: ${HAYAMIMI_THREADS:-4}
+      HAYAMIMI_MAX_RESIDENT: ${HAYAMIMI_MAX_RESIDENT:-3}
+      HAYAMIMI_MIN_SILENCE: ${HAYAMIMI_MIN_SILENCE:-0.35}
+      HAYAMIMI_MAX_SPEECH: ${HAYAMIMI_MAX_SPEECH:-12}
+      HAYAMIMI_LANG_SWITCH_GUARD: ${HAYAMIMI_LANG_SWITCH_GUARD:-2.0}
+      HAYAMIMI_SERVE_HOST: 0.0.0.0
+      HAYAMIMI_SERVE_PORT: 8765
+      HAYAMIMI_TRANSLATE: ${HAYAMIMI_TRANSLATE:-zh-Hant}
+      HAYAMIMI_TRANSLATION_BACKEND: hymt2
+      HAYAMIMI_TRANSLATION_API_URL: http://translator:8000
+      HAYAMIMI_TRANSLATION_MODEL: ${TRANSLATION_MODEL:-tencent/Hy-MT2-1.8B}
+      HAYAMIMI_TRANSLATION_TIMEOUT: ${HAYAMIMI_TRANSLATION_TIMEOUT:-5}
+      HAYAMIMI_TRANSLATION_TEMPERATURE: ${HAYAMIMI_TRANSLATION_TEMPERATURE:-0}
+      HAYAMIMI_TRANSLATION_MAX_TOKENS: ${HAYAMIMI_TRANSLATION_MAX_TOKENS:-512}
+      HAYAMIMI_TRANSLATE_PARTIALS: ${HAYAMIMI_TRANSLATE_PARTIALS:-true}
+      HAYAMIMI_TRANSLATION_CONTEXT_LINES: ${HAYAMIMI_TRANSLATION_CONTEXT_LINES:-4}
+      HAYAMIMI_TRANSLATION_GLOSSARY: ${HAYAMIMI_TRANSLATION_GLOSSARY:-}
+      HAYAMIMI_TRANSLATOR_STARTUP_TIMEOUT: ${HAYAMIMI_TRANSLATOR_STARTUP_TIMEOUT:-900}
+      HAYAMIMI_TRANSCRIPT: ${HAYAMIMI_TRANSCRIPT:-/app/data/transcript.txt}
+      HAYAMIMI_HOTWORDS: ${HAYAMIMI_HOTWORDS:-}
+      HAYAMIMI_REPLACE: ${HAYAMIMI_REPLACE:-}
+      HAYAMIMI_SPEAKERS: ${HAYAMIMI_SPEAKERS:-false}
+      HAYAMIMI_NO_REFINE: ${HAYAMIMI_NO_REFINE:-false}
+      HAYAMIMI_WAV: ${HAYAMIMI_WAV:-}
+      HAYAMIMI_NO_REALTIME: ${HAYAMIMI_NO_REALTIME:-false}
+    volumes:
+      - ./models:/app/models
+      - ./data:/app/data
+      - ./config:/app/config:ro
+    devices:
+      - /dev/snd:/dev/snd
+    ports:
+      - "${HAYAMIMI_BIND_ADDRESS:-127.0.0.1}:${HAYAMIMI_PORT:-8765}:8765"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8765/healthz', timeout=2)"]
+      interval: 15s
+      timeout: 4s
+      retries: 10
+      start_period: 5m
