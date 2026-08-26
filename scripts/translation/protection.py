@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from collections import Counter
 from dataclasses import dataclass
 
 
@@ -32,12 +33,27 @@ class ProtectedText:
             restored = restored.replace(placeholder, original)
         return restored
 
+    def placeholder_mismatch(self, translated: str) -> str | None:
+        """Return an error when placeholders are missing, duplicated or invented."""
+        expected = Counter(self.placeholders)
+        found = Counter(_PLACEHOLDER_RE.findall(translated))
+        if expected == found:
+            return None
+
+        missing = list((expected - found).elements())
+        extra = list((found - expected).elements())
+        details = []
+        if missing:
+            details.append("missing: " + ", ".join(missing))
+        if extra:
+            details.append("extra/duplicated: " + ", ".join(extra))
+        return "; ".join(details) or "placeholder count mismatch"
+
     def missing_placeholders(self, translated: str) -> tuple[str, ...]:
-        return tuple(
-            placeholder
-            for placeholder, _ in self.replacements
-            if placeholder not in translated
-        )
+        """Backward-compatible helper retained for callers/tests."""
+        found = Counter(_PLACEHOLDER_RE.findall(translated))
+        expected = Counter(self.placeholders)
+        return tuple((expected - found).elements())
 
 
 class SensitiveSpanProtector:
