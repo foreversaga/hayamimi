@@ -1,188 +1,235 @@
 # Realtime Translation v2
 
-## Goal
+Status: **implemented** on the Docker service path.
 
-Add low-latency, stable, high-quality subtitle translation without replacing hayamimi's existing specialist STT routing.
+See [`DOCKER.md`](../DOCKER.md) for deployment and startup instructions.
 
-The target pipeline is:
+## Architecture
 
 ```text
 Audio
   -> Silero VAD
-  -> hayamimi specialist STT
+  -> language ID + specialist hayamimi STT
   -> partial/final transcript
-  -> StreamingTranslationWorker
-  -> translation backend
-  -> validation + placeholder restore
+  -> RealtimeTranslationRuntime
+  -> final-first / latest-wins worker
+  -> Hy-MT2 OpenAI-compatible backend
+  -> immutable-span validation
   -> Local Agreement / LCP
-  -> dashboard / OBS / transcript
+  -> SSE
+  -> dashboard / OBS overlay / transcript
 ```
 
-The translation layer is intentionally decoupled from STT. Hayamimi remains CPU-capable, while translation can run on a local GPU, another machine, or a dedicated inference server.
+STT and translation stay decoupled. The `hayamimi` Docker service runs VAD/STT/UI while the `translator` service runs `tencent/Hy-MT2-1.8B` through vLLM.
 
-## Research conclusion
+## Why this design
 
-The 2025-2026 simultaneous translation systems with the best quality/latency trade-offs converge on a cascaded design:
+Recent simultaneous-translation systems converge on a cascaded re-translation design: use strong ASR, re-translate the current source prefix, compare consecutive target hypotheses, then commit only stable target prefixes. This provides a better quality/latency trade-off than showing every raw re-translation.
 
-1. obtain a strong, stable ASR hypothesis;
-2. re-translate the current stable source prefix;
-3. compare consecutive target hypotheses;
-4. emit only the target prefix that remains stable across revisions.
-
-This is the Local Agreement / Longest Common Prefix (LCP) approach used by strong IWSLT simultaneous translation systems. It avoids the flicker produced by blindly displaying every re-translation.
-
-Relevant references:
+References:
 
 - IWSLT 2026 Simultaneous Translation: https://iwslt.org/2026/simultaneous
 - IWSLT 2026 baseline: https://github.com/owaski/iwslt-2026-baselines
-- Pinch-AST, IWSLT 2026: https://aclanthology.org/2026.iwslt-1.30/
+- Pinch-AST: https://aclanthology.org/2026.iwslt-1.30/
 - NeMo IWSLT 2026 system: https://aclanthology.org/2026.iwslt-1.23/
 - Hy-MT2: https://github.com/Tencent-Hunyuan/Hy-MT2
-- MiLMMT: https://github.com/xiaomi-research/gemmax
 
-## Model candidates
+## Translation model
 
-### Primary realtime candidate: Hy-MT2-1.8B
-
-Use `tencent/Hy-MT2-1.8B` as the first realtime candidate.
-
-Reasons:
-
-- translation-specific 1.8B model;
-- native Japanese, English, Korean, Chinese, Cantonese and Traditional Chinese targets;
-- official vLLM, SGLang and llama.cpp deployment paths;
-- small enough for aggressive low-latency testing;
-- terminology and instruction-following support;
-- current model family is explicitly positioned for translation and subtitle scenarios.
-
-The backend follows Hy-MT2's official default translation instruction:
+Default:
 
 ```text
-Translate the following text into {target language}.
-Only output the translated result without additional explanation.
+tencent/Hy-MT2-1.8B
 ```
 
-Hy-MT2's published inference example recommends sampling. Realtime v2 initially uses `temperature=0` instead because Local Agreement needs deterministic hypotheses. This is a deliberate deviation that must be benchmarked against the official sampling configuration.
+The model is translation-specific, small enough for low-latency serving, supports Japanese/English/Korean/Chinese/Cantonese/Traditional Chinese and many other languages, and has an official vLLM deployment path.
 
-### Quality challenger: MiLMMT-46-4B-v1.0
+The realtime backend uses the official task shape—translate to a named target language and output only the translation—but defaults to deterministic decoding:
 
-Benchmark `xiaomi-research/MiLMMT-46-4B-v1.0` against Hy-MT2-1.8B. It is a translation-specialized multilingual model with native Simplified and Traditional Chinese support and should be treated as a quality challenger, not assumed to be faster.
+```text
+temperature = 0
+repetition_penalty = 1.05
+```
 
-### Optional finalizer: Hy-MT2-7B
+Deterministic output improves Local Agreement stability. The vendor sampling recipe should be treated as a benchmark alternative rather than the realtime default.
 
-Only add a second, larger finalization model if measurements show that its quality gain is large enough to justify the additional latency and memory. Do not start with a two-model architecture by default.
+## Partial translation
 
-### Existing FuguMT / M2M-100
+STT drafts are decoded about every 0.5 seconds. Every changed draft can become a translation revision.
 
-Keep the existing models as compatibility and CPU baselines until the new path has measured coverage and regression tests.
+Partial requests are **latest-wins**. If revisions 10, 11 and 12 arrive while revision 10 is still translating, only the newest pending revision is retained. This prevents translation backlog from turning into increasing end-to-end latency.
 
-## Streaming policy
+Final requests:
 
-### Partial translations
+- replace any pending partial for the same segment/target;
+- are processed before queued partials;
+- are never dropped as stale.
 
-Every new stable STT partial may trigger a translation request, but partial requests are **latest-wins**.
+## Segment identity
 
-If revisions 10, 11 and 12 arrive while revision 10 is still translating, only revision 12 should remain queued. This prevents a slow model from creating an ever-growing delay backlog.
+Each VAD utterance gets a stable segment id based on its absolute sample start:
 
-### Final translations
+```text
+seg-<sample-index>
+```
 
-Final requests are never dropped and are processed before queued partials.
+Partial and final STT events use the same segment id. Translation events also carry this id, so the dashboard attaches translations to the correct source card instead of assuming the latest translation belongs to the latest source sentence.
 
-### Local Agreement
+Refined groups use:
+
+```text
+refine-<first-sample>-<last-sample>
+```
+
+## Local Agreement
 
 For CJK targets (`ja`, `zh`, `zh-Hant`, `yue`, `ko`), agreement is character-based.
+
+For whitespace languages, agreement is token-based so incomplete words are not committed.
 
 Example:
 
 ```text
 revision A: 今天要介紹新的
 revision B: 今天要介紹一個新的模型
-stable:     今天要介紹
+committed:  今天要介紹
+speculative: 一個新的模型
 ```
 
-The stable prefix becomes append-only committed text. The remainder stays speculative and may change on the next revision.
-
-For whitespace-delimited languages, agreement is token-based so an incomplete word is never committed.
+If a later partial contradicts already committed text, the speculative suffix is frozen rather than slicing and splicing incompatible strings. The utterance-final translation is authoritative and may correct the displayed sentence.
 
 ## Correctness protection
 
-Before translation, immutable spans are replaced by placeholders such as:
+Before inference, immutable source spans are converted to placeholders:
 
 ```text
 __HAYAMIMI_KEEP_0000__
 ```
 
-Initial protected types:
+Protected categories include:
 
 - URLs;
 - email addresses;
 - version strings;
-- ASCII numbers and percentages.
+- ASCII numbers and percentages;
+- mixed alphanumeric technical/product identifiers such as `Qwen3.8`, `RTX5070Ti`, `CUDA12.9` and `H3`.
 
-After translation:
+Validation requires every expected placeholder to occur **exactly once** in the translation. A result is rejected if a placeholder is missing, duplicated, or invented.
 
-1. every placeholder must still be present;
-2. missing placeholders reject the translation update;
-3. placeholders are restored to their exact original value;
-4. empty, implausibly long, or obvious repetition-loop outputs are rejected.
+Additional rejection checks cover:
 
-This is stricter than the legacy `digits_consistent()` guard because the model never gets permission to rewrite protected values.
+- empty translations;
+- implausibly long outputs;
+- obvious token repetition loops.
 
-Future entity protection should add typed handling for money, dates, times, units, IDs and named entities. Typed entities are intentionally separate from the first implementation because blindly restoring a whole source-language money expression would preserve the number but prevent correct unit translation.
+After validation, placeholders are restored exactly.
 
 ## Context and glossary
 
-`TranslationContext` supports:
-
-- recent finalized source/target subtitle pairs;
-- terminology pairs.
-
-Only a short history should be sent on realtime requests. The history is context, not content to be re-translated.
-
-The default cap for the first integration should be the latest four finalized subtitle pairs.
-
-## Code structure
+Every target language can keep a short history of finalized `(source, translation)` pairs. Default history length:
 
 ```text
-scripts/translation/
-  contracts.py
-  coordinator.py
-  protection.py
-  validation.py
-  worker.py
-  backends/
-    openai_compatible.py
-  policies/
-    local_agreement.py
+4 lines
 ```
 
-Responsibilities:
+History is prompt context only and is explicitly excluded from requested output.
 
-- `contracts.py`: backend-independent request/update objects and protocol;
-- `coordinator.py`: protection, validation and per-segment Local Agreement state;
-- `worker.py`: background scheduling; final-first and latest-wins partials;
-- `backends/`: inference adapters;
-- `policies/`: target emission policy;
-- `protection.py`: immutable source spans;
-- `validation.py`: output safety checks.
-
-The realtime STT pipeline should depend only on these contracts, not on Hy-MT2 or a particular inference framework.
-
-## Deployment
-
-Recommended first test:
-
-```bash
-vllm serve tencent/Hy-MT2-1.8B --host 0.0.0.0 --port 8000
-```
-
-The hayamimi translation backend defaults to:
+A glossary can be mounted from `config/` using:
 
 ```text
-http://127.0.0.1:8000/v1/chat/completions
+source=target
 ```
 
-SGLang or another OpenAI-compatible local server can be substituted without changing the STT pipeline.
+or tab / arrow separators. Example: [`config/glossary.example.txt`](../config/glossary.example.txt).
+
+## SSE event types
+
+Source:
+
+```text
+partial
+final
+refine
+```
+
+Realtime MT:
+
+```text
+translation_partial
+translation_final
+translation_refine
+translation_error
+```
+
+The legacy finalized translation event remains available as:
+
+```text
+translation
+```
+
+for backward compatibility when `--translation-backend legacy` is used outside the lean Docker image.
+
+## UI
+
+`subtitle_server.py` provides:
+
+- `/` — OBS-friendly transparent overlay;
+- `/dashboard` — live source + partial/final translations + refined transcript;
+- `/transcript` — refined transcript history;
+- `/events` — SSE stream;
+- `/healthz` — health endpoint.
+
+SSE clients receive heartbeat comments and use bounded queues so a stalled browser cannot create unbounded server memory growth.
+
+## Docker deployment
+
+The compose stack contains:
+
+```text
+translator -> vLLM + Hy-MT2 GPU service
+hayamimi   -> CPU STT + translation coordinator + HTTP/SSE UI
+```
+
+Model storage is outside both images:
+
+```text
+./models/              hayamimi ASR/VAD models
+./models/huggingface/  Hy-MT2/Hugging Face cache
+./models/vllm-cache/   vLLM cache
+```
+
+Container rebuilds therefore do not redownload model weights.
+
+The translation service uses a fixed KV-cache budget rather than a percentage-based GPU memory reservation:
+
+```text
+VLLM_KV_CACHE_MEMORY=2G
+VLLM_KV_CACHE_DTYPE=auto
+VLLM_MAX_MODEL_LEN=8192
+VLLM_MAX_NUM_SEQS=4
+```
+
+Native KV dtype is the quality-first default. FP8 KV can be evaluated later as an explicit speed/memory experiment.
+
+Host ports bind to loopback by default. Set `HAYAMIMI_BIND_ADDRESS=0.0.0.0` only when the dashboard/overlay must be reachable from another machine.
+
+## CLI compatibility
+
+The non-Docker script supports both backends:
+
+```text
+--translation-backend legacy|hymt2
+--translation-api-url URL
+--translation-model MODEL
+--translation-timeout SEC
+--translation-temperature FLOAT
+--translation-max-tokens N
+--translate-partials / --no-translate-partials
+--translation-context-lines N
+--translation-glossary PATH
+```
+
+The existing FuguMT/M2M-100 path is not removed. The Docker runtime is intentionally lean and defaults to Hy-MT2.
 
 ## Benchmarking
 
@@ -192,105 +239,36 @@ Use:
 python scripts/bench_translation_v2.py benchmark.jsonl \
   --api-url http://127.0.0.1:8000 \
   --model tencent/Hy-MT2-1.8B \
-  --output results-hymt2-1.8b.jsonl
+  --output results.jsonl
 ```
 
-Input is JSONL. Example:
+The harness records acceptance/rejection and p50/p95/p99/max backend latency. Reference translations can be retained in JSONL for external COMET/XCOMET/chrF scoring.
 
-```json
-{"id":"ja-001","source_lang":"ja","target_lang":"zh-Hant","text":"会議は午後3時から始まります。"}
-{"id":"ja-002","source_lang":"ja","target_lang":"zh-Hant","text":"Qwen3.8をvLLM 0.10.0で動かします。","glossary":[["Qwen3.8","Qwen3.8"],["vLLM","vLLM"]]}
-```
-
-The built-in harness records:
-
-- accepted/rejected updates;
-- backend latency;
-- p50 / p95 / p99 / max latency;
-- raw source/reference/output for external quality scoring.
-
-For model selection, add external translation quality scoring with XCOMET/COMET and evaluate at least:
+Recommended evaluation corpus categories:
 
 - normal conversation;
-- broadcast/news speech;
-- technical content;
-- proper nouns;
-- mixed Japanese/English terms;
-- numbers;
-- dates/times;
-- money;
+- broadcast/news;
+- technical discussion;
+- names and terminology;
+- mixed CJK/English terms;
+- numbers, dates, time and money;
 - long utterances;
 - incomplete STT prefixes.
 
-## Acceptance targets
+## Tests
 
-Initial engineering targets:
+`tests/test_translation_v2.py` covers model-free behavior including:
 
-| Metric | Target |
-|---|---:|
-| Partial STT cadence | <= 500 ms |
-| Translation queue growth | bounded, no stale backlog |
-| Stable partial translation | < 1 s after usable source prefix on target hardware |
-| Final STT -> final translation p50 | < 300 ms |
-| Final STT -> final translation p95 | < 1 s |
-| Committed subtitle erasure | 0 |
-| Protected placeholder survival | 100% |
-| Catastrophic repetition | 0 |
-| Empty accepted translations | 0 |
+- placeholder round-trip;
+- technical-identifier protection;
+- missing and duplicated placeholder rejection;
+- CJK and whitespace Local Agreement;
+- committed-prefix conflict handling;
+- latest-wins partial scheduling;
+- final priority;
+- target parsing;
+- glossary parsing;
+- runtime final event publication;
+- exact same-language target bypass.
 
-Actual latency targets must be validated on the intended hardware. Vendor benchmark latency is not treated as production evidence.
-
-## Integration phases
-
-### Phase 1 - foundation
-
-Implemented on `feature/realtime-translation-v2`:
-
-- model-independent contracts;
-- Hy-MT2 OpenAI-compatible backend;
-- Local Agreement policy;
-- immutable span protection;
-- output validation;
-- latest-wins background worker;
-- benchmark harness;
-- model-free unit tests.
-
-### Phase 2 - realtime_transcribe integration
-
-Add CLI options without removing legacy translation:
-
-```text
---translation-backend legacy|hymt2
---translation-api-url URL
---translation-model MODEL
---translate-partials
---translation-temperature FLOAT
---translation-context-lines N
---translation-glossary PATH
-```
-
-Then:
-
-- assign a segment id and monotonic revision to each partial STT hypothesis;
-- submit partial translation requests only when source text changes;
-- use detected/sticky source language;
-- submit final requests with priority;
-- publish `translation_partial` and `translation_final` SSE events;
-- keep the current legacy `translation` event for compatibility during migration.
-
-### Phase 3 - model bake-off
-
-Benchmark Hy-MT2-1.8B, MiLMMT-46-4B-v1.0, Hy-MT2-7B and current legacy MT on the same subtitle corpus and hardware.
-
-Choose the production default from measured quality/latency, not model size or vendor claims.
-
-### Phase 4 - optional high-quality finalizer
-
-Only if required by benchmark results:
-
-```text
-partial STT -> 1.8B realtime translation -> Local Agreement
-final STT   -> larger finalizer          -> final replace/commit
-```
-
-The realtime path must remain useful even if the finalizer is unavailable.
+The GitHub workflow additionally compiles the Python entrypoints and validates `docker compose config` on Linux.
