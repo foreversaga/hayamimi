@@ -15,17 +15,18 @@ class _LatestWinsBuffer:
         self._partials: dict[tuple[str, str], TranslationRequest] = {}
         self._closed = False
 
-    def put(self, request: TranslationRequest) -> None:
+    def put(self, request: TranslationRequest) -> bool:
         key = (request.segment_id, request.target_lang)
         with self._condition:
             if self._closed:
-                return
+                return False
             if request.is_final:
                 self._partials.pop(key, None)
                 self._finals.append(request)
             else:
                 self._partials[key] = request
             self._condition.notify()
+            return True
 
     def get(self) -> TranslationRequest | None:
         with self._condition:
@@ -57,20 +58,36 @@ class StreamingTranslationWorker:
         self._buffer = _LatestWinsBuffer()
         self._lock = threading.Lock()
         self._latest_revision: dict[tuple[str, str], int] = {}
+        self._closed = False
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
-    def submit(self, request: TranslationRequest) -> None:
+    def submit(self, request: TranslationRequest) -> bool:
         key = (request.segment_id, request.target_lang)
         with self._lock:
+            if self._closed:
+                return False
             self._latest_revision[key] = max(
                 request.revision,
                 self._latest_revision.get(key, request.revision),
             )
-        self._buffer.put(request)
+        accepted = self._buffer.put(request)
+        if not accepted:
+            with self._lock:
+                self._latest_revision.pop(key, None)
+        return accepted
 
-    def close(self) -> None:
-        self._buffer.close()
+    def close(self, wait: bool = False, timeout: float | None = None) -> None:
+        with self._lock:
+            if self._closed:
+                already_closed = True
+            else:
+                self._closed = True
+                already_closed = False
+        if not already_closed:
+            self._buffer.close()
+        if wait and threading.current_thread() is not self._thread:
+            self._thread.join(timeout=timeout)
 
     def _run(self) -> None:
         while True:
