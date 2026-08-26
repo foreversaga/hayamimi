@@ -1,0 +1,9 @@
+# source=target
+# Copy this file to config/glossary.txt and set:
+# HAYAMIMI_TRANSLATION_GLOSSARY=/app/config/glossary.txt
+
+Qwen=Qwen
+vLLM=vLLM
+ComfyUI=ComfyUI
+MiniMax=MiniMax
+早耳=早耳
