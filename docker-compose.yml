@@ -24,7 +24,7 @@ services:
       - --kv-cache-memory-bytes
       - ${VLLM_KV_CACHE_MEMORY:-2G}
       - --kv-cache-dtype
-      - ${VLLM_KV_CACHE_DTYPE:-fp8}
+      - ${VLLM_KV_CACHE_DTYPE:-auto}
       - --max-num-seqs
       - ${VLLM_MAX_NUM_SEQS:-4}
       - --enable-prefix-caching
