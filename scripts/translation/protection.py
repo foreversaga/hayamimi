@@ -8,11 +8,15 @@ from dataclasses import dataclass
 _PLACEHOLDER_PREFIX = "__HAYAMIMI_KEEP_"
 _PLACEHOLDER_RE = re.compile(r"__HAYAMIMI_KEEP_\d{4}__")
 
-# Order matters: URLs and emails must be captured before their numeric parts.
+# Order matters: URLs and emails must be captured before technical identifiers
+# and their numeric parts. Mixed identifiers cover model/product tokens such as
+# Qwen3.8, RTX5070Ti, H3 and CUDA12.9 without freezing ordinary prose.
 _PROTECTED_SPAN_RE = re.compile(
     r"https?://[^\s<>]+"
     r"|www\.[^\s<>]+"
     r"|[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}"
+    r"|(?<![A-Za-z0-9_])[A-Za-z][A-Za-z0-9_.+-]*\d[A-Za-z0-9_.+-]*(?![A-Za-z0-9_])"
+    r"|(?<![A-Za-z0-9_])\d+[A-Za-z][A-Za-z0-9_.+-]*(?![A-Za-z0-9_])"
     r"|\b[vV]?\d+(?:\.\d+){1,4}(?:[-+][A-Za-z0-9._-]+)?\b"
     r"|(?<![A-Za-z0-9_])[+-]?\d+(?:[.,]\d+)*(?:%|％)?(?![A-Za-z0-9_])"
 )
@@ -50,7 +54,6 @@ class ProtectedText:
         return "; ".join(details) or "placeholder count mismatch"
 
     def missing_placeholders(self, translated: str) -> tuple[str, ...]:
-        """Backward-compatible helper retained for callers/tests."""
         found = Counter(_PLACEHOLDER_RE.findall(translated))
         expected = Counter(self.placeholders)
         return tuple((expected - found).elements())
