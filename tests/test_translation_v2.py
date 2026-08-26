@@ -51,14 +51,32 @@ def test_protection_roundtrip():
     assert protected.restore(protected.text) == "vLLM 0.10.0 costs 500 and mail a@b.com"
 
 
+def test_protection_preserves_mixed_technical_identifiers():
+    source = "Qwen3.8 runs on RTX5070Ti with CUDA12.9 and H3"
+    protected = SensitiveSpanProtector().protect(source)
+    assert protected.text.count("__HAYAMIMI_KEEP_") == 4
+    assert protected.restore(protected.text) == source
+
+
 def test_cjk_local_agreement_commits_common_prefix():
     policy = LocalAgreementPolicy("zh-Hant")
     first = policy.update("今天要介紹新的")
     assert first.committed == ""
+    assert first.speculative == "今天要介紹新的"
 
     second = policy.update("今天要介紹一個新的模型")
     assert second.committed == "今天要介紹"
     assert second.speculative == "一個新的模型"
+
+
+def test_local_agreement_freezes_when_committed_prefix_is_contradicted():
+    policy = LocalAgreementPolicy("zh-Hant")
+    policy.update("今天要介紹新的")
+    policy.update("今天要介紹一個新的模型")
+    conflicted = policy.update("今日將介紹另一款模型")
+
+    assert conflicted.committed == "今天要介紹"
+    assert conflicted.speculative == ""
 
 
 def test_latin_local_agreement_never_commits_partial_word():
