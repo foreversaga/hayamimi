@@ -11,16 +11,39 @@ from ..protection import SensitiveSpanProtector
 
 _TARGET_LANGUAGE_NAMES = {
     "ar": "Arabic",
+    "bn": "Bengali",
+    "bo": "Tibetan",
+    "cs": "Czech",
     "de": "German",
     "en": "English",
     "es": "Spanish",
+    "fa": "Persian",
     "fr": "French",
+    "gu": "Gujarati",
+    "he": "Hebrew",
+    "hi": "Hindi",
+    "id": "Indonesian",
     "it": "Italian",
     "ja": "Japanese",
+    "kk": "Kazakh",
+    "km": "Khmer",
     "ko": "Korean",
+    "mn": "Mongolian",
+    "mr": "Marathi",
+    "ms": "Malay",
+    "my": "Burmese",
+    "nl": "Dutch",
+    "pl": "Polish",
     "pt": "Portuguese",
     "ru": "Russian",
+    "ta": "Tamil",
+    "te": "Telugu",
     "th": "Thai",
+    "tl": "Filipino",
+    "tr": "Turkish",
+    "ug": "Uyghur",
+    "uk": "Ukrainian",
+    "ur": "Urdu",
     "vi": "Vietnamese",
     "yue": "Cantonese",
     "zh": "Chinese",
@@ -38,11 +61,12 @@ class OpenAICompatibleConfig:
     model: str = "tencent/Hy-MT2-1.8B"
     timeout_s: float = 5.0
     temperature: float = 0.0
+    repetition_penalty: float = 1.05
     max_tokens: int = 512
 
 
 class HyMT2OpenAIBackend:
-    """Hy-MT2 backend served by vLLM/SGLang/llama.cpp OpenAI-compatible API."""
+    """Hy-MT2 backend served by a vLLM/SGLang OpenAI-compatible API."""
 
     def __init__(self, config: OpenAICompatibleConfig | None = None):
         self._config = config or OpenAICompatibleConfig()
@@ -52,9 +76,11 @@ class HyMT2OpenAIBackend:
         payload = {
             "model": self._config.model,
             "messages": [{"role": "user", "content": prompt}],
-            # Hy-MT2 recommends sampling, but deterministic decoding is the
-            # safer default for Local Agreement. Benchmark before changing it.
+            # Hy-MT2 publishes a sampling recipe. Streaming Local Agreement is
+            # more stable with deterministic decoding, so temperature=0 is the
+            # realtime default while keeping the official repetition penalty.
             "temperature": self._config.temperature,
+            "repetition_penalty": self._config.repetition_penalty,
             "max_tokens": self._config.max_tokens,
         }
         data = json.dumps(payload).encode("utf-8")
@@ -99,14 +125,15 @@ class HyMT2OpenAIBackend:
                 for source, target in request.context.history[-4:]
             ]
             sections.append(
-                "Use the following recent subtitle context only to preserve terminology and meaning. "
-                "Do not translate the context again:\n" + "\n\n".join(history_lines)
+                "Use the following recent subtitle context only to preserve terminology, names, "
+                "pronouns and meaning. Do not translate or repeat the context itself:\n"
+                + "\n\n".join(history_lines)
             )
 
         if SensitiveSpanProtector.contains_placeholder(request.text):
             sections.append(
-                "Preserve every placeholder matching __HAYAMIMI_KEEP_0000__ exactly. "
-                "Do not omit, alter, translate, or reorder placeholders."
+                "The source contains immutable placeholders such as __HAYAMIMI_KEEP_0000__. "
+                "Preserve each placeholder exactly once. Do not alter, omit or translate it."
             )
 
         sections.append(
