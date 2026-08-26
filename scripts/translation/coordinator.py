@@ -45,12 +45,18 @@ class StreamingTranslationCoordinator:
             translated = self._backend.translate(protected_request)
         except Exception as exc:
             latency_ms = (time.perf_counter() - started) * 1000
-            return self._rejected(request, policy, latency_ms, str(exc))
+            return self._reject(request, key, policy, latency_ms, str(exc))
         latency_ms = (time.perf_counter() - started) * 1000
 
         validation = self._validator.validate(request.text, translated, protected)
         if not validation.valid:
-            return self._rejected(request, policy, latency_ms, validation.reason or "invalid translation")
+            return self._reject(
+                request,
+                key,
+                policy,
+                latency_ms,
+                validation.reason or "invalid translation",
+            )
 
         restored = protected.restore(translated).strip()
         snapshot = policy.finalize(restored) if request.is_final else policy.update(restored)
@@ -69,13 +75,16 @@ class StreamingTranslationCoordinator:
             latency_ms=latency_ms,
         )
 
-    @staticmethod
-    def _rejected(
+    def _reject(
+        self,
         request: TranslationRequest,
+        key: tuple[str, str],
         policy: LocalAgreementPolicy,
         latency_ms: float,
         reason: str,
     ) -> TranslationUpdate:
+        if request.is_final:
+            self._policies.pop(key, None)
         return TranslationUpdate(
             segment_id=request.segment_id,
             revision=request.revision,
