@@ -171,6 +171,29 @@ def test_runtime_publishes_final_translation_and_drains_on_close():
     assert finals[0]["text"] == "今天介紹新模型"
 
 
+def test_runtime_completes_all_multi_target_finals_before_cleanup():
+    backend = FakeBackend(["繁中結果", "English result"])
+    server = CaptureServer()
+    runtime = RealtimeTranslationRuntime(
+        StreamingTranslationCoordinator(backend),
+        targets=("zh-Hant", "en"),
+        server=server,
+        translate_partials=False,
+    )
+
+    runtime.submit_final("seg-200", "ja", "翻訳テスト")
+    runtime.close(wait=True)
+
+    finals = [event for event in server.events if event["type"] == "translation_final"]
+    assert [(event["lang"], event["text"]) for event in finals] == [
+        ("zh-Hant", "繁中結果"),
+        ("en", "English result"),
+    ]
+    assert runtime._revisions == {}
+    assert runtime._pending_final_targets == {}
+    assert runtime._final_meta == {}
+
+
 def test_runtime_skips_exact_same_language_target():
     backend = FakeBackend([])
     runtime = RealtimeTranslationRuntime(
