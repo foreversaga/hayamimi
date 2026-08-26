@@ -67,10 +67,8 @@ class RealtimeTranslationRuntime:
         self._lock = threading.Lock()
         self._revisions: dict[str, int] = defaultdict(int)
         self._last_partial: dict[str, str] = {}
-        # Only final/refine requests need metadata for history/mode. Stale
-        # partials are intentionally dropped by the worker and therefore must
-        # not allocate metadata that waits for a callback that will never run.
         self._final_meta: dict[tuple[str, str, int], tuple[str, str]] = {}
+        self._pending_final_targets: dict[tuple[str, int], int] = {}
         self._history: dict[str, deque[tuple[str, str]]] = {
             target: deque(maxlen=self._context_lines or 1) for target in targets
         }
@@ -108,11 +106,11 @@ class RealtimeTranslationRuntime:
             self._revisions[segment_id] += 1
             revision = self._revisions[segment_id]
 
-        submitted = False
+        requests: list[TranslationRequest] = []
         for target in self.targets:
             if source_lang == target:
                 continue
-            request = TranslationRequest(
+            requests.append(TranslationRequest(
                 segment_id=segment_id,
                 revision=revision,
                 source_lang=source_lang or "auto",
@@ -120,18 +118,32 @@ class RealtimeTranslationRuntime:
                 text=text,
                 is_final=is_final,
                 context=self._build_context(target),
-            )
+            ))
+
+        if not requests:
             if is_final:
                 with self._lock:
-                    self._final_meta[(segment_id, target, revision)] = (text, mode)
+                    self._revisions.pop(segment_id, None)
+            return
+
+        if is_final:
+            with self._lock:
+                self._pending_final_targets[(segment_id, revision)] = len(requests)
+                for request in requests:
+                    self._final_meta[(segment_id, request.target_lang, revision)] = (text, mode)
+
+        accepted_count = 0
+        for request in requests:
             if self._worker.submit(request):
-                submitted = True
+                accepted_count += 1
             elif is_final:
                 with self._lock:
-                    self._final_meta.pop((segment_id, target, revision), None)
+                    self._final_meta.pop((segment_id, request.target_lang, revision), None)
+                    self._decrement_pending_final_locked(segment_id, revision)
 
-        if is_final and not submitted:
+        if is_final and accepted_count == 0:
             with self._lock:
+                self._pending_final_targets.pop((segment_id, revision), None)
                 self._revisions.pop(segment_id, None)
 
     def _build_context(self, target: str) -> TranslationContext:
@@ -144,7 +156,7 @@ class RealtimeTranslationRuntime:
         if update.is_final:
             with self._lock:
                 source_text, mode = self._final_meta.pop(key, ("", "final"))
-                self._revisions.pop(update.segment_id, None)
+                self._decrement_pending_final_locked(update.segment_id, update.revision)
         else:
             source_text, mode = "", "partial"
 
@@ -196,3 +208,15 @@ class RealtimeTranslationRuntime:
                 "text": update.full_text,
                 "latency_ms": update.latency_ms,
             })
+
+    def _decrement_pending_final_locked(self, segment_id: str, revision: int) -> None:
+        key = (segment_id, revision)
+        remaining = self._pending_final_targets.get(key)
+        if remaining is None:
+            return
+        remaining -= 1
+        if remaining <= 0:
+            self._pending_final_targets.pop(key, None)
+            self._revisions.pop(segment_id, None)
+        else:
+            self._pending_final_targets[key] = remaining
