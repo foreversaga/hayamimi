@@ -9,6 +9,7 @@ from translation.contracts import TranslationRequest
 from translation.coordinator import StreamingTranslationCoordinator
 from translation.policies import LocalAgreementPolicy, longest_stable_prefix
 from translation.protection import SensitiveSpanProtector
+from translation.worker import _LatestWinsBuffer
 
 
 class FakeBackend:
@@ -68,3 +69,26 @@ def test_coordinator_rejects_dropped_placeholder():
 
     assert not update.accepted
     assert "missing protected placeholders" in update.error
+    assert coordinator._policies == {}
+
+
+def test_latest_wins_buffer_coalesces_partial_revisions():
+    buffer = _LatestWinsBuffer()
+    buffer.put(make_request("draft 1", 1))
+    buffer.put(make_request("draft 2", 2))
+
+    request = buffer.get()
+    assert request is not None
+    assert request.revision == 2
+    assert request.text == "draft 2"
+
+
+def test_final_replaces_pending_partial_and_has_priority():
+    buffer = _LatestWinsBuffer()
+    buffer.put(make_request("draft", 1))
+    buffer.put(make_request("final", 2, final=True))
+
+    request = buffer.get()
+    assert request is not None
+    assert request.is_final
+    assert request.revision == 2
