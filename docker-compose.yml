@@ -29,7 +29,7 @@ services:
       - ${VLLM_MAX_NUM_SEQS:-4}
       - --enable-prefix-caching
     ports:
-      - "${TRANSLATOR_PORT:-8000}:8000"
+      - "127.0.0.1:${TRANSLATOR_PORT:-8000}:8000"
     deploy:
       resources:
         reservations:
@@ -87,7 +87,7 @@ services:
     devices:
       - /dev/snd:/dev/snd
     ports:
-      - "${HAYAMIMI_PORT:-8765}:8765"
+      - "${HAYAMIMI_BIND_ADDRESS:-127.0.0.1}:${HAYAMIMI_PORT:-8765}:8765"
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8765/healthz', timeout=2)"]
       interval: 15s
