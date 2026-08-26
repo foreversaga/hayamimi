@@ -80,8 +80,20 @@ def test_coordinator_rejects_dropped_placeholder():
     update = coordinator.translate(make_request("価格は500円です", 1, final=True))
 
     assert not update.accepted
-    assert "missing protected placeholders" in update.error
+    assert "protected placeholder mismatch" in update.error
+    assert "missing" in update.error
     assert coordinator._policies == {}
+
+
+def test_coordinator_rejects_duplicated_placeholder():
+    backend = FakeBackend([
+        "價格是 __HAYAMIMI_KEEP_0000__ 元，重複 __HAYAMIMI_KEEP_0000__"
+    ])
+    coordinator = StreamingTranslationCoordinator(backend)
+    update = coordinator.translate(make_request("価格は500円です", 1, final=True))
+
+    assert not update.accepted
+    assert "extra/duplicated" in update.error
 
 
 def test_latest_wins_buffer_coalesces_partial_revisions():
