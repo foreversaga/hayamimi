@@ -46,12 +46,7 @@ def load_glossary(path: str) -> tuple[tuple[str, str], ...]:
 
 
 class RealtimeTranslationRuntime:
-    """Bridges STT revisions to the model-independent streaming translator.
-
-    The runtime owns revision numbers, short translation history and SSE event
-    publication. Inference remains on StreamingTranslationWorker's background
-    thread, so the ASR/VAD hot path never waits for the translation model.
-    """
+    """Bridges STT revisions to the model-independent streaming translator."""
 
     def __init__(
         self,
@@ -72,7 +67,10 @@ class RealtimeTranslationRuntime:
         self._lock = threading.Lock()
         self._revisions: dict[str, int] = defaultdict(int)
         self._last_partial: dict[str, str] = {}
-        self._request_meta: dict[tuple[str, str, int], tuple[str, str]] = {}
+        # Only final/refine requests need metadata for history/mode. Stale
+        # partials are intentionally dropped by the worker and therefore must
+        # not allocate metadata that waits for a callback that will never run.
+        self._final_meta: dict[tuple[str, str, int], tuple[str, str]] = {}
         self._history: dict[str, deque[tuple[str, str]]] = {
             target: deque(maxlen=self._context_lines or 1) for target in targets
         }
@@ -97,7 +95,6 @@ class RealtimeTranslationRuntime:
         self._submit(segment_id, source_lang, text, is_final=True, mode="final")
 
     def submit_refine(self, segment_id: str, source_lang: str, text: str) -> None:
-        """Translate the second-pass refined transcript as a separate final event."""
         text = text.strip()
         if not text:
             return
@@ -111,12 +108,10 @@ class RealtimeTranslationRuntime:
             self._revisions[segment_id] += 1
             revision = self._revisions[segment_id]
 
+        submitted = False
         for target in self.targets:
-            # Exact same-language targets do not need MT. zh -> zh-Hant is not
-            # skipped because script conversion is a legitimate translation.
             if source_lang == target:
                 continue
-            context = self._build_context(target)
             request = TranslationRequest(
                 segment_id=segment_id,
                 revision=revision,
@@ -124,11 +119,20 @@ class RealtimeTranslationRuntime:
                 target_lang=target,
                 text=text,
                 is_final=is_final,
-                context=context,
+                context=self._build_context(target),
             )
+            if is_final:
+                with self._lock:
+                    self._final_meta[(segment_id, target, revision)] = (text, mode)
+            if self._worker.submit(request):
+                submitted = True
+            elif is_final:
+                with self._lock:
+                    self._final_meta.pop((segment_id, target, revision), None)
+
+        if is_final and not submitted:
             with self._lock:
-                self._request_meta[(segment_id, target, revision)] = (text, mode)
-            self._worker.submit(request)
+                self._revisions.pop(segment_id, None)
 
     def _build_context(self, target: str) -> TranslationContext:
         with self._lock:
@@ -137,8 +141,12 @@ class RealtimeTranslationRuntime:
 
     def _on_update(self, update: TranslationUpdate) -> None:
         key = (update.segment_id, update.target_lang, update.revision)
-        with self._lock:
-            source_text, mode = self._request_meta.pop(key, ("", "final" if update.is_final else "partial"))
+        if update.is_final:
+            with self._lock:
+                source_text, mode = self._final_meta.pop(key, ("", "final"))
+                self._revisions.pop(update.segment_id, None)
+        else:
+            source_text, mode = "", "partial"
 
         if not update.accepted:
             print(
