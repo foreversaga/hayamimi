@@ -43,7 +43,7 @@ class AgreementSnapshot:
 
 
 class LocalAgreementPolicy:
-    """Append-only emission using agreement between consecutive hypotheses."""
+    """Append-only partial emission using agreement between consecutive hypotheses."""
 
     def __init__(self, target_lang: str):
         self._target_lang = target_lang
@@ -65,10 +65,22 @@ class LocalAgreementPolicy:
                 self._committed = stable.rstrip()
 
         self._previous = hypothesis
-        speculative = hypothesis[len(self._committed):].lstrip()
+
+        if not self._committed:
+            speculative = hypothesis
+        elif hypothesis.startswith(self._committed):
+            speculative = hypothesis[len(self._committed):].lstrip()
+        else:
+            # A later re-translation contradicted text that was already stable
+            # across two revisions. Never splice a suffix by character count;
+            # freeze the partial display and let the authoritative final
+            # translation correct the sentence at the utterance boundary.
+            speculative = ""
+
         return AgreementSnapshot(self._committed, speculative)
 
     def finalize(self, hypothesis: str) -> AgreementSnapshot:
+        """Accept the utterance-final translation as authoritative output."""
         hypothesis = hypothesis.strip()
         if hypothesis:
             self._committed = hypothesis
