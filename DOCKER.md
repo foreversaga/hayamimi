@@ -32,12 +32,18 @@ On first startup:
 2. hayamimi downloads its ASR/VAD models into `./models/`.
 3. `hayamimi` starts after the translator health check succeeds.
 
-Open:
+Open locally:
 
 - Dashboard: `http://localhost:8765/dashboard`
 - OBS overlay: `http://localhost:8765/`
 - Refined transcript: `http://localhost:8765/transcript`
 - Health check: `http://localhost:8765/healthz`
+
+Both published ports bind to localhost by default. The translator API stays local. To expose only the subtitle UI/dashboard to another machine on the LAN, set:
+
+```dotenv
+HAYAMIMI_BIND_ADDRESS=0.0.0.0
+```
 
 Stop without deleting models:
 
