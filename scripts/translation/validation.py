@@ -5,7 +5,6 @@ from dataclasses import dataclass
 
 from .protection import ProtectedText
 
-
 _REPEATED_TOKEN_RE = re.compile(r"(?:^|\s)(\S+)(?:\s+\1){5,}(?:\s|$)", re.IGNORECASE)
 
 
@@ -24,9 +23,9 @@ class TranslationValidator:
         if not candidate:
             return ValidationResult(False, "empty translation")
 
-        missing = protected.missing_placeholders(candidate)
-        if missing:
-            return ValidationResult(False, f"missing protected placeholders: {', '.join(missing)}")
+        mismatch = protected.placeholder_mismatch(candidate)
+        if mismatch:
+            return ValidationResult(False, f"protected placeholder mismatch: {mismatch}")
 
         source_len = max(len(source.strip()), 1)
         if len(candidate) > source_len * self._max_length_ratio + 64:
