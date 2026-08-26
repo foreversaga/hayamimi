@@ -2,6 +2,7 @@
 
 import os
 import sys
+import threading
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scripts"))
 
@@ -9,6 +10,7 @@ from translation.contracts import TranslationRequest
 from translation.coordinator import StreamingTranslationCoordinator
 from translation.policies import LocalAgreementPolicy, longest_stable_prefix
 from translation.protection import SensitiveSpanProtector
+from translation.runtime import RealtimeTranslationRuntime, load_glossary, parse_targets
 from translation.worker import _LatestWinsBuffer
 
 
@@ -20,6 +22,16 @@ class FakeBackend:
     def translate(self, request):
         self.requests.append(request)
         return next(self.outputs)
+
+
+class CaptureServer:
+    def __init__(self):
+        self.events = []
+        self.updated = threading.Event()
+
+    def publish(self, event):
+        self.events.append(event)
+        self.updated.set()
 
 
 def make_request(text, revision, final=False, target="zh-Hant"):
@@ -74,8 +86,8 @@ def test_coordinator_rejects_dropped_placeholder():
 
 def test_latest_wins_buffer_coalesces_partial_revisions():
     buffer = _LatestWinsBuffer()
-    buffer.put(make_request("draft 1", 1))
-    buffer.put(make_request("draft 2", 2))
+    assert buffer.put(make_request("draft 1", 1))
+    assert buffer.put(make_request("draft 2", 2))
 
     request = buffer.get()
     assert request is not None
@@ -92,3 +104,50 @@ def test_final_replaces_pending_partial_and_has_priority():
     assert request is not None
     assert request.is_final
     assert request.revision == 2
+
+
+def test_parse_targets_deduplicates_and_preserves_order():
+    assert parse_targets("zh-Hant, en,zh-Hant,ko") == ("zh-Hant", "en", "ko")
+
+
+def test_load_glossary_supports_common_separators(tmp_path):
+    path = tmp_path / "glossary.txt"
+    path.write_text("Qwen=Qwen\nvLLM\tvLLM\n早耳→Hayamimi\n", encoding="utf-8")
+    assert load_glossary(str(path)) == (
+        ("Qwen", "Qwen"),
+        ("vLLM", "vLLM"),
+        ("早耳", "Hayamimi"),
+    )
+
+
+def test_runtime_publishes_final_translation_and_drains_on_close():
+    backend = FakeBackend(["今天介紹新模型"])
+    server = CaptureServer()
+    runtime = RealtimeTranslationRuntime(
+        StreamingTranslationCoordinator(backend),
+        targets=("zh-Hant",),
+        server=server,
+        translate_partials=False,
+        context_lines=2,
+    )
+
+    runtime.submit_final("seg-100", "ja", "今日は新しいモデルを紹介します")
+    runtime.close(wait=True)
+
+    finals = [event for event in server.events if event["type"] == "translation_final"]
+    assert len(finals) == 1
+    assert finals[0]["segment_id"] == "seg-100"
+    assert finals[0]["lang"] == "zh-Hant"
+    assert finals[0]["text"] == "今天介紹新模型"
+
+
+def test_runtime_skips_exact_same_language_target():
+    backend = FakeBackend([])
+    runtime = RealtimeTranslationRuntime(
+        StreamingTranslationCoordinator(backend),
+        targets=("ja",),
+        translate_partials=True,
+    )
+    runtime.submit_final("seg-1", "ja", "こんにちは")
+    runtime.close(wait=True)
+    assert backend.requests == []
